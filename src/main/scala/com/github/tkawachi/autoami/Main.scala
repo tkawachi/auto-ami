@@ -45,7 +45,7 @@ object Main extends LazyLogging {
     loop(None, Nil).flatMap(_.getInstances.asScala)
   }
 
-  def backup(ec2: AmazonEC2Client, instance: Instance, now: Date) = {
+  def backup(ec2: AmazonEC2Client, instance: Instance, now: Date): Option[String] = {
     val instanceId = instance.getInstanceId
     logger.info(s"Start backup $instanceId")
     val tags = instance.getTags.asScala
@@ -139,14 +139,21 @@ object Main extends LazyLogging {
     val now = new Date
 
     val fs = Regions.values().map { regions =>
-      Future {
-        val ec2 = new AmazonEC2Client(credentials)
-        val region = Region.getRegion(regions)
-
+      val ec2 = new AmazonEC2Client(credentials)
+      val region = Region.getRegion(regions)
+      val instancesFut = Future {
         ec2.setRegion(region)
-        val instances = getRunningInstances(ec2)
-        instances.map { i =>
-          backup(ec2, i, now)
+        getRunningInstances(ec2)
+      }
+      instancesFut.flatMap { instances =>
+        Future.traverse(instances) { instance =>
+          Future {
+            backup(ec2, instance, now)
+          }.recover {
+            case e: Throwable =>
+              logger.error(e.getMessage)
+              None
+          }
         }
       }
     }
