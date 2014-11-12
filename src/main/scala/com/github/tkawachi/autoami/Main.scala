@@ -4,24 +4,25 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.{ Date, Locale }
 
-import com.amazonaws.auth.{ AWSCredentialsProvider, DefaultAWSCredentialsProviderChain }
-import com.amazonaws.regions.{ Regions, Region }
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain
+import com.amazonaws.regions.{ Region, Regions }
 import com.amazonaws.services.ec2.AmazonEC2Client
 import com.amazonaws.services.ec2.model._
+import com.typesafe.scalalogging.LazyLogging
+
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
-
-import scala.concurrent.{ Await, Future }
-import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.util.{ Try, Failure, Success }
+import scala.concurrent.duration._
+import scala.concurrent.{ Await, Future }
+import scala.util.{ Failure, Success, Try }
 
 /**
  * Main entry point.
  *
  * inspired by http://blog.suz-lab.com/2012/05/ec2ami.html
  */
-object Main {
+object Main extends LazyLogging {
   val BACKUP_GENERATION = "BackupGeneration"
   val dateFormat = new SimpleDateFormat("yyyyMMddHHmmss", Locale.US)
 
@@ -46,7 +47,7 @@ object Main {
 
   def backup(ec2: AmazonEC2Client, instance: Instance, now: Date) = {
     val instanceId = instance.getInstanceId
-
+    logger.info(s"Start backup $instanceId")
     val tags = instance.getTags.asScala
     val imageTag = tags.find(_.getKey == "Name").map(_.getValue).getOrElse(instanceId)
     val generation = tags.find(_.getKey == BACKUP_GENERATION)
@@ -66,12 +67,14 @@ object Main {
   }
 
   def createImage(ec2: AmazonEC2Client, imageName: String, instanceId: String): String = {
+    logger.debug(s"Creating an AMI named $imageName from $instanceId")
     val req = new CreateImageRequest()
       .withInstanceId(instanceId)
       .withName(imageName)
       .withNoReboot(true)
       .withDescription(s"Created from $instanceId.")
     val resp = ec2.createImage(req)
+    logger.info(s"AMI ${resp.getImageId} ($imageName) was created from $instanceId")
     resp.getImageId
   }
 
@@ -88,16 +91,26 @@ object Main {
 
   def deleteImages(ec2: AmazonEC2Client, images: List[Image]): Unit = {
     images.foreach { image =>
+      logger.debug(s"AMI ${image.getImageId} (${image.getName}) will be deleted")
       ec2.deregisterImage(new DeregisterImageRequest(image.getImageId))
+      logger.info(s"AMI ${image.getImageId} (${image.getName}) was deleted")
       image.getBlockDeviceMappings.asScala.foreach { mapping =>
         val snapshotId = mapping.getEbs.getSnapshotId
+        logger.debug(s"Snapshot $snapshotId used by ${image.getImageId} will be deleted")
         ec2.deleteSnapshot(new DeleteSnapshotRequest(snapshotId))
+        logger.info(s"Snapshot $snapshotId used by ${image.getImageId} was deleted")
       }
     }
   }
 
   def tagImage(ec2: AmazonEC2Client, imageId: String, imageTag: String): Unit = {
-    ec2.createTags(new CreateTagsRequest().withResources(imageId).withTags(new Tag("Name", imageTag), new Tag("BackupType", "auto")))
+    logger.debug(s"$imageId will be tagged. Name: $imageTag, BackupType: auto")
+    ec2.createTags(
+      new CreateTagsRequest()
+        .withResources(imageId)
+        .withTags(new Tag("Name", imageTag), new Tag("BackupType", "auto"))
+    )
+    logger.info(s"$imageId was tagged. Name: $imageTag, BackupType: auto")
   }
 
   def basename(path: String): String = new File(path).getName
@@ -108,6 +121,7 @@ object Main {
       image.getBlockDeviceMappings.asScala.foreach { mapping =>
         val snapshotId = mapping.getEbs.getSnapshotId
         val snapshotTag = s"${image.getName}-${basename(mapping.getDeviceName)}"
+        logger.debug(s"$snapshotId will be tagged. Name: $snapshotTag, BackupType: auto")
         ec2.createTags(
           new CreateTagsRequest().withResources(snapshotId)
             .withTags(
@@ -115,6 +129,7 @@ object Main {
               new Tag("BackupType", "auto")
             )
         )
+        logger.info(s"$snapshotId was tagged. Name: $snapshotTag, BackupType: auto")
       }
     }
   }
@@ -126,7 +141,9 @@ object Main {
     val fs = Regions.values().map { regions =>
       Future {
         val ec2 = new AmazonEC2Client(credentials)
-        ec2.setRegion(Region.getRegion(regions))
+        val region = Region.getRegion(regions)
+
+        ec2.setRegion(region)
         val instances = getRunningInstances(ec2)
         instances.map { i =>
           backup(ec2, i, now)
@@ -136,8 +153,8 @@ object Main {
 
     fs.foreach { f =>
       f.onComplete {
-        case Success(l) => l.foreach(println)
-        case Failure(e) => println(e.getMessage)
+        case Success(l) =>
+        case Failure(e) => logger.error(e.getMessage)
       }
       Await.ready(f, 1.minute)
     }

@@ -11,5 +11,8 @@ scalariformSettings
 doctestSettings
 
 libraryDependencies ++= Seq(
-  "com.amazonaws" % "aws-java-sdk-ec2" % "1.9.4"
+  "ch.qos.logback" % "logback-classic" % "1.1.2",
+  "com.amazonaws" % "aws-java-sdk-ec2" % "1.9.4",
+  "com.github.nscala-time" %% "nscala-time" % "1.4.0",
+  "com.typesafe.scala-logging" %% "scala-logging" % "3.1.0"
 )
