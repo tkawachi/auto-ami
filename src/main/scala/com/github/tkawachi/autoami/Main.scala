@@ -116,8 +116,39 @@ object Main extends LazyLogging {
   def basename(path: String): String = new File(path).getName
 
   def tagSnapshots(ec2: AmazonEC2Client, imageId: String): Unit = {
-    val resp = ec2.describeImages(new DescribeImagesRequest().withImageIds(imageId))
-    resp.getImages.asScala.foreach { image =>
+    val retrySleepMs = 3000
+
+    @tailrec
+    def loop(retryCnt: Int): Option[Image] = {
+      if (retryCnt <= 0) {
+        logger.error(s"Give up describeImages($imageId)")
+        None
+      } else {
+        val resp = ec2.describeImages(new DescribeImagesRequest().withImageIds(imageId))
+        val images = resp.getImages.asScala
+        if (images.size <= 0) {
+          logger.debug(s"describeImages($imageId) doesn't contain any result, retrying")
+          Thread.sleep(retrySleepMs)
+          loop(retryCnt - 1)
+        } else {
+          val image = images.head
+          val notReady = image.getBlockDeviceMappings.asScala.exists { mapping =>
+            Option(mapping.getEbs.getSnapshotId).isEmpty
+          }
+          if (notReady) {
+            logger.debug(s"snapshotId is not ready for $imageId, retrying")
+            Thread.sleep(retrySleepMs)
+            loop(retryCnt - 1)
+          } else {
+            Some(image)
+          }
+        }
+      }
+    }
+
+    loop(60).foreach { image =>
+      // TODO BlockDeviceMappings might become empty?
+      logger.debug(s"BlockDeviceMappings $imageId: ${image.getBlockDeviceMappings.asScala.map(_.getDeviceName).toList}")
       image.getBlockDeviceMappings.asScala.foreach { mapping =>
         val snapshotId = mapping.getEbs.getSnapshotId
         val snapshotTag = s"${image.getName}-${basename(mapping.getDeviceName)}"
