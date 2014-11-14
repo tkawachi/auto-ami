@@ -187,7 +187,7 @@ object Main extends LazyLogging {
         case Success(l) =>
         case Failure(e) => logger.error(e.getMessage)
       }
-      Await.ready(f, 1.minute)
+      Await.ready(f, config.timeout)
     }
   }
 
