@@ -6,6 +6,22 @@ version := "0.0.1-SNAPSHOT"
 
 scalaVersion := "2.11.4"
 
+scalacOptions ++= Seq(
+  "-deprecation",
+  "-encoding", "UTF-8",
+  "-feature",
+  "-unchecked",
+  "-Xfatal-warnings",
+  "-Xlint",
+  "-Xfuture",
+  "-Yno-adapted-args",
+  "-Ywarn-dead-code",        // N.B. doesn't work well with the ??? hole
+  "-Ywarn-numeric-widen",
+  "-Ywarn-value-discard",
+  "-Ywarn-unused",
+  "-Ywarn-unused-import"     // 2.11 only
+)
+
 scalariformSettings
 
 doctestSettings
