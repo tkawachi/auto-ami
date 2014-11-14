@@ -23,16 +23,15 @@ import scala.util.{ Failure, Success, Try }
  * inspired by http://blog.suz-lab.com/2012/05/ec2ami.html
  */
 object Main extends LazyLogging {
-  val BACKUP_GENERATION = "BackupGeneration"
   val dateFormat = new SimpleDateFormat("yyyyMMddHHmmss", Locale.US)
 
-  def getRunningInstances(ec2: AmazonEC2Client): List[Instance] = {
+  def getRunningInstances(ec2: AmazonEC2Client, config: Config): List[Instance] = {
     @tailrec
     def loop(nextToken: Option[String], accum: List[Reservation]): List[Reservation] = {
       val resp = ec2.describeInstances(
         new DescribeInstancesRequest().withFilters(
           new Filter("instance-state-name").withValues("running"),
-          new Filter("tag-key").withValues(BACKUP_GENERATION)
+          new Filter("tag-key").withValues(config.backupGenerationKey)
         )
       )
       val list = accum ++ resp.getReservations.asScala
@@ -45,23 +44,23 @@ object Main extends LazyLogging {
     loop(None, Nil).flatMap(_.getInstances.asScala)
   }
 
-  def backup(ec2: AmazonEC2Client, instance: Instance, now: Date): Option[String] = {
+  def backup(ec2: AmazonEC2Client, instance: Instance, now: Date, config: Config): Option[String] = {
     val instanceId = instance.getInstanceId
     logger.info(s"Start backup $instanceId")
     val tags = instance.getTags.asScala
     val imageTag = tags.find(_.getKey == "Name").map(_.getValue).getOrElse(instanceId)
-    val generation = tags.find(_.getKey == BACKUP_GENERATION)
+    val generation = tags.find(_.getKey == config.backupGenerationKey)
       .flatMap(tag => Try(tag.getValue.toInt).toOption)
 
     generation.map { gen =>
       val imageName = s"$imageTag-${dateFormat.format(now)}"
       // Keep (gen - 1) old images.
       val keepOld = gen - 1
-      val images = findDeleteImages(ec2, imageTag, keepOld)
+      val images = findDeleteImages(ec2, imageTag, keepOld, config)
       val imageId = createImage(ec2, imageName, instanceId)
       deleteImages(ec2, images)
-      tagImage(ec2, imageId, imageTag)
-      tagSnapshots(ec2, imageId)
+      tagImage(ec2, imageId, imageTag, config)
+      tagSnapshots(ec2, imageId, config)
       imageId
     }
   }
@@ -78,13 +77,10 @@ object Main extends LazyLogging {
     resp.getImageId
   }
 
-  def findDeleteImages(ec2: AmazonEC2Client, imageTag: String, generation: Int): List[Image] = {
-
-    val req = new DescribeImagesRequest().withFilters(
-      new Filter("tag:Name").withValues(imageTag),
-      new Filter("tag:BackupType").withValues("auto")
-    )
-    val resp = ec2.describeImages(req)
+  def findDeleteImages(ec2: AmazonEC2Client, imageTag: String, generation: Int, config: Config): List[Image] = {
+    val filters = config.markerTags.updated("Name", imageTag)
+    logger.debug(s"Finding images to delete: $filters")
+    val resp = ec2.describeImages(new DescribeImagesRequest().withFilters(filters.toFilters))
     val images = resp.getImages.asScala.toList
     images.sortBy(_.getName).dropRight(generation)
   }
@@ -103,21 +99,18 @@ object Main extends LazyLogging {
     }
   }
 
-  def tagImage(ec2: AmazonEC2Client, imageId: String, imageTag: String): Unit = {
-    logger.debug(s"$imageId will be tagged. Name: $imageTag, BackupType: auto")
+  def tagImage(ec2: AmazonEC2Client, imageId: String, imageTag: String, config: Config): Unit = {
+    val tags = config.markerTags.updated("Name", imageTag)
+    logger.debug(s"$imageId will be tagged. $tags")
     ec2.createTags(
-      new CreateTagsRequest()
-        .withResources(imageId)
-        .withTags(new Tag("Name", imageTag), new Tag("BackupType", "auto"))
+      new CreateTagsRequest().withResources(imageId).withTags(tags.toTags)
     )
-    logger.info(s"$imageId was tagged. Name: $imageTag, BackupType: auto")
+    logger.info(s"$imageId was tagged. $tags")
   }
 
   def basename(path: String): String = new File(path).getName
 
-  def tagSnapshots(ec2: AmazonEC2Client, imageId: String): Unit = {
-    val retrySleepMs = 3000
-
+  def tagSnapshots(ec2: AmazonEC2Client, imageId: String, config: Config): Unit = {
     @tailrec
     def loop(retryCnt: Int): Option[Image] = {
       if (retryCnt <= 0) {
@@ -128,7 +121,7 @@ object Main extends LazyLogging {
         val images = resp.getImages.asScala
         if (images.size <= 0) {
           logger.debug(s"describeImages($imageId) doesn't contain any result, retrying")
-          Thread.sleep(retrySleepMs)
+          Thread.sleep(config.retryDelay.toMillis)
           loop(retryCnt - 1)
         } else {
           val image = images.head
@@ -137,7 +130,7 @@ object Main extends LazyLogging {
           }
           if (notReady) {
             logger.debug(s"snapshotId is not ready for $imageId, retrying")
-            Thread.sleep(retrySleepMs)
+            Thread.sleep(config.retryDelay.toMillis)
             loop(retryCnt - 1)
           } else {
             Some(image)
@@ -146,27 +139,27 @@ object Main extends LazyLogging {
       }
     }
 
-    loop(60).foreach { image =>
+    loop(config.maxRetry).foreach { image =>
       // TODO BlockDeviceMappings might become empty?
       logger.debug(s"BlockDeviceMappings $imageId: ${image.getBlockDeviceMappings.asScala.map(_.getDeviceName).toList}")
       image.getBlockDeviceMappings.asScala.foreach { mapping =>
         val snapshotId = mapping.getEbs.getSnapshotId
         val snapshotTag = s"${image.getName}-${basename(mapping.getDeviceName)}"
-        logger.debug(s"$snapshotId will be tagged. Name: $snapshotTag, BackupType: auto")
+        val tags = config.markerTags.updated("Name", snapshotTag)
+        logger.debug(s"$snapshotId will be tagged. $tags")
         ec2.createTags(
           new CreateTagsRequest().withResources(snapshotId)
-            .withTags(
-              new Tag("Name", snapshotTag),
-              new Tag("BackupType", "auto")
-            )
+            .withTags(tags.toTags)
         )
-        logger.info(s"$snapshotId was tagged. Name: $snapshotTag, BackupType: auto")
+        logger.info(s"$snapshotId was tagged. $tags")
       }
     }
   }
 
   def main(args: Array[String]): Unit = {
     val credentials = new DefaultAWSCredentialsProviderChain
+    val config = Config()
+
     val now = new Date
 
     val fs = Regions.values().map { regions =>
@@ -174,12 +167,12 @@ object Main extends LazyLogging {
       val region = Region.getRegion(regions)
       val instancesFut = Future {
         ec2.setRegion(region)
-        getRunningInstances(ec2)
+        getRunningInstances(ec2, config)
       }
       instancesFut.flatMap { instances =>
         Future.traverse(instances) { instance =>
           Future {
-            backup(ec2, instance, now)
+            backup(ec2, instance, now, config)
           }.recover {
             case e: Throwable =>
               logger.error(e.getMessage)
@@ -196,5 +189,13 @@ object Main extends LazyLogging {
       }
       Await.ready(f, 1.minute)
     }
+  }
+
+  implicit class ImplicitMapStringString(val m: Map[String, String]) extends AnyVal {
+    def toTags: java.util.List[Tag] =
+      m.map { case (k, v) => new Tag(k, v) }.toList.asJava
+
+    def toFilters: java.util.List[Filter] =
+      m.map { case (k, v) => new Filter(s"tag:$k").withValues(v) }.toList.asJava
   }
 }
